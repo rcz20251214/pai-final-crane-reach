@@ -10,7 +10,7 @@ Gazebo 上のロボットアーム CRANE+ V2 が、天井カメラの画像か�
 - GPU のない Docker 環境でも動く**軽量なシミュレーション起動**
 - シミュレータで成功率を測る**閉ループ評価**と、失敗原因の分析にもとづく改善
 
-動画：https://youtu.be/Ypjbgfm7LS0
+動画：（YouTube の URL を記入）
 
 ## 結果
 
@@ -88,6 +88,7 @@ ros2 launch pai_reach_sim sim.launch.py viewer:=true
 | `image_width` / `image_height` | `224` / `168` | カメラ画像のサイズ |
 | `camera_rate` | `10` | カメラの撮影周期 [Hz] |
 | `render_engine` | `ogre2` | `ogre` にすると CPU 描画で速くなる場合がある |
+| `finger_mu` | （空） | 指（固定指・可動指）の摩擦係数。空なら元の URDF の 0.2。把持では `1.0`（指先にゴムを貼った想定） |
 
 立方体を手で動かす場合：
 
@@ -165,6 +166,63 @@ ros2 run pai_reach_sim evaluate --ros-args \
 - 結果は `trials.csv`（試行ごと）と `summary.json`（集計）に保存されます。2cm・3cm・5cmでの成功率、途中で一度でも届いた割合、水平・高さ方向の誤差も記録します。
 - `--temporal-ensemble`：毎ステップ推論し、重なった予測を指数重みで平均します（ACT 論文の手法）。省略すると、学習時の `n_action_steps` ごとにまとめて実行します。
 - 立方体の位置は `eval_seed`（既定1000）で決まるので、同じ値なら全モデルを同じ配置で比べられます。
+
+## 発展：つかんで持ち上げる
+
+`task:=grasp` で、横から物体をつかんで8cm持ち上げ、止まる動作を、同じパイプライン（お手本の自動生成 → LeRobotDataset → ACT → Gazebo で評価）で学習しました。物体を手先に固定する仕組み（DetachableJoint など）は使わず、指と物体の接触と摩擦だけで持ち上げます。
+
+| # | 条件 | デモ数 | 評価時間 | 成功率（20か所） |
+|---|---|---|---|---|
+| G1 | 固定指・手のひらとの隙間 4mm | 100 | 15秒 | 45%（9/20） |
+| G2 | **隙間 9.5mm**（置き方だけ変更） | 100 | 15秒 | **90%（18/20）** |
+
+- 成功 = 試行終了時に物体が4cm以上持ち上がっている。どちらも同じ20か所（`eval_seed=1000`）で評価。
+- G1 で成功した9か所は G2 でもすべて成功し、G2 で新たに9か所が成功しました（符号検定 p = 0.004、Fisher の正確検定 p = 0.006）。
+- G1 の失敗の多くは、方策の数mmの位置ずれで固定指（黒）が物体の上に降りてしまうものでした。お手本の段階で隙間を広げるだけで、学習した方策の成功率が倍になりました。
+
+### つかみ方を決めるまで
+
+CRANE+ V2 の可動指（白）は付け根の軸で回るだけで、固定指（黒）と平行になるのは全開（-30°）のときだけです。4cmの立方体に触れる角度では約50°傾いているため、面ではなく角で押して、立方体をずらしてしまいました。そこで物体を **直径5.5cm・高さ4cmの赤い円柱**（`worlds/grasp_table.sdf`）にしました。円柱なら、どの角度で当たっても向きが関係ありません。
+
+指のあいだは手のひら側が広く、指先側が狭い V 字です。閉じると、可動指の先が円柱を手のひら側へ引き寄せます。4cmの円柱では、引き寄せられた先で可動指が上限（約38°）まで閉じても届きませんでした。5.5cm にすると、手のひら・固定指・可動指の3点で包むように握れます（可動指は約27°で円柱に当たって止まり、指令 30°との差の分だけ締めます）。寸法と角度は CRANE+ V2 の衝突メッシュから計算し、Gazebo で確かめました。
+
+元の URDF では指の摩擦係数が 0.2 で、物体側を大きくしても、接触では小さいほうの 0.2 が効いて滑ります。実機で指先にゴムを貼るのと同じ想定で、把持のときは指だけ 1.0 にします（`finger_mu:=1.0`）。
+
+お手本のスクリプトは、立方体が持ち上がらなかった試行の rosbag を自動で消し、成功したお手本だけを残します（G2 の置き方では 10/10 成功）。
+
+```bash
+# 円柱のワールドで起動
+ros2 launch pai_reach_sim sim.launch.py viewer:=true world:=grasp_table.sdf finger_mu:=1.0
+
+# お手本を100本集める（G2）
+ros2 run pai_reach_sim scripted_demo --ros-args -p task:=grasp -p final_hold:=3.0 \
+    -p num_episodes:=100 -p out_dir:=/home/ubuntu/dataset/rosbags/grasp_wide
+
+# 変換（pai_training の pixi 環境で）と学習は到達タスクと同じ。名前だけ crane_grasp_wide / act_grasp_wide にする
+
+# 推論ノード
+pixi run python ~/pai_ws/src/pai-final-crane-reach/training/infer_node.py \
+    --model-path ~/checkpoints/act_grasp_wide/last --no-autostart --temporal-ensemble 0.01
+
+# 学習した方策の評価（成功 = 試行終了時に立方体が4cm以上持ち上がっている）
+ros2 run pai_reach_sim evaluate --ros-args -p task:=grasp -p trial_time:=15.0 \
+    -p num_trials:=20 -p eval_dir:=/home/ubuntu/eval/act_grasp_wide -p label:=act_grasp_wide
+```
+
+| パラメータ | 既定値 | 内容 |
+|---|---|---|
+| `grasp_height` | `0.033` | 指の中心の高さ [m, 机の上面から]。円柱は高さ4cm |
+| `pregrasp_up` | `0.06` | 降りる前に構える高さ（`grasp_height` に加算） |
+| `lift` | `0.08` | 持ち上げる高さ [m] |
+| `gripper_close` | `0.52` | 閉じる角度 [rad]（約30°）。指は約27°で円柱に当たって止まる。0.48〜0.56 で成功を確認 |
+| `lifted_threshold` | `0.04` | これ以上持ち上がれば成功 [m] |
+| `grasp_depth` | `0.0985` | 物体の中心を置く位置（link4 原点からハンドの向きに沿った距離 [m]）。大きいほど指先寄り |
+| `grasp_lateral` | `0.0` | 物体の中心の、固定指（黒）側へのずれ [m] |
+| `close_time` | `2.0` | ハンドを閉じる時間 [s] |
+| `settle_min` / `settle_max` | `1.0` / `4.0` | 閉じた後、指の実際の角度が止まるまで待つ時間の最短・最長 [s] |
+| `lift_time` | `2.5` | 持ち上げる時間 [s] |
+
+立方体の位置は `ros2 run pai_reach_sim randomize_cube pose` で確認できます（`randomize_cube grasp` で把持用の範囲に置き直し）。
 
 ## ライセンスとクレジット
 
